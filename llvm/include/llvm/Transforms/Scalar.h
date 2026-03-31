@@ -208,6 +208,15 @@ FunctionPass *createInstSimplifyLegacyPass();
 // and scatter intrinsics with scalar code when target doesn't support them.
 //
 FunctionPass *createScalarizeMaskedMemIntrinLegacyPass();
+
+//===----------------------------------------------------------------------===//
+//
+// createAddZextAfterAllocaPass - This pass Adds zext-trunc after load
+//
+FunctionPass *createAddZextAfterAllocaPass();
+
+FunctionPass *createKawahitoZextAlgorithmPass();
+
 } // End llvm namespace
 
 #endif

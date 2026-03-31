@@ -49,6 +49,8 @@ void initializeGlobalISel(PassRegistry &);
 void initializeTarget(PassRegistry &);
 
 void initializeAAResultsWrapperPassPass(PassRegistry &);
+void initializeAddZextAfterAllocaPass(PassRegistry &);
+void initializeKawahitoZextAlgorithmPass(PassRegistry &);
 void initializeAlwaysInlinerLegacyPassPass(PassRegistry &);
 void initializeAssignmentTrackingAnalysisPass(PassRegistry &);
 void initializeAssumptionCacheTrackerPass(PassRegistry &);

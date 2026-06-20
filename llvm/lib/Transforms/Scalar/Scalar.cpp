@@ -19,8 +19,6 @@ using namespace llvm;
 /// initializeScalarOptsPasses - Initialize all passes linked into the
 /// ScalarOpts library.
 void llvm::initializeScalarOpts(PassRegistry &Registry) {
-  initializeAddZextAfterAllocaPass(Registry);  // <-- ΠΡΟΣΘΕΣΕ
-  initializeKawahitoZextAlgorithmPass(Registry);
   initializeConstantHoistingLegacyPassPass(Registry);
   initializeDCELegacyPassPass(Registry);
   initializeScalarizerLegacyPassPass(Registry);

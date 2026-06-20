@@ -1,401 +1,713 @@
-//===-- KawahitoZextAlgorithm.cpp - Eliminate redundant zext ------*- C++ -*-===//
-//
-// Kawahito algorithm — EliminateOneExtend (Fig. 11):
-//
-//   required = FALSE
-//
-//   /* DU-chain: AnalyzeUSE */
-//   for (I = all instructions that USE the destination operand of SXT):
-//     required = AnalyzeUSE(SXT, I, TRUE)
-//     if (required) break
-//
-//   /* UD-chain: AnalyzeDEF */
-//   if (!required):
-//     for (I = all instructions that DEFINE the source operand of SXT):
-//       required = AnalyzeDEF(I)
-//       if (required) break
-//
-//   if (!required) eliminate SXT
-//
-// AnalyzeUSE(SXT, I, ANALYZE_ARRAY) — Fig. 13 (Case 1 + Case 2, no AnalyzeARRAY):
-//   FALSE = extension unnecessary (user doesn't need type S)
-//   TRUE  = extension necessary
-//
-//   Case 1: source operand of I does NOT require type S → return FALSE
-//   Case 2: requirement of type S of source operand == dest type of I
-//           → walk DU-chain: for each J using dest operand of I:
-//               if AnalyzeUSE(SXT, J, ...) return TRUE
-//             return FALSE
-//   Case 3: AnalyzeARRAY — skipped, return TRUE conservatively
-//   Default: return TRUE
-//
-// AnalyzeDEF(I) — Fig. 12:
-//   FALSE = extension unnecessary
-//   TRUE  = extension necessary
-//
-//   Case 1: dest type of I == ShortTy → return FALSE
-//   Case 2: dest type == src type of I (same-width)
-//           → walk UD-chain: for each J defining src operand of I:
-//               if AnalyzeDEF(J) return TRUE
-//             return FALSE
-//   Default: return TRUE
-//
-//===----------------------------------------------------------------------===//
 
-#include "llvm/Transforms/Scalar/KawahitoZextAlgorithm.h"
-#include "llvm/Pass.h"
+
+
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/PassManager.h"
+#include "llvm/IR/Module.h"
+#include "llvm/Analysis/BlockFrequencyInfo.h"
+#include "llvm/Analysis/BranchProbabilityInfo.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/SmallSet.h"
-#include "llvm/InitializePasses.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Transforms/Scalar/KawahitoZextAlgorithm.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
 
 namespace {
 
-struct KawahitoAnalyzer {
-  // The narrow type S — source type of the zext being analyzed (e.g. i32)
-  Type *ShortTy = nullptr;
-  // The wide type — destination type of the zext (e.g. i64)
-  Type *WideTy  = nullptr;
+class EliminateRedundantZext {
+public:
+  explicit EliminateRedundantZext(Function &F, BlockFrequencyInfo &BFI)
+      : F(F), DL(F.getParent()->getDataLayout()), BFI(BFI) {}
 
-  // Visited sets for cycle detection (USE flag / DEF flag from paper)
-  SmallSet<Instruction *, 16> VisitedUSE;
-  SmallSet<Instruction *, 16> VisitedDEF;
+  bool run() {
+    std::vector<std::pair<BasicBlock*, uint64_t>> blocks = getBasicBlocksHotness();
+    std::vector<ZExtInst*> zexts = getZExtInstructions(blocks);
+    bool Changed = false;
 
-  // -----------------------------------------------------------------------
-  // AnalyzeUSE(SXT, I) — Fig. 13, Case 1 + Case 2 only (no AnalyzeARRAY)
-  //
-  // Walks FORWARD through users of the zext's result.
-  //
-  // FALSE = the narrow type S is NOT required at this use → zext unnecessary
-  // TRUE  = the narrow type S IS required → zext necessary
-  //
-  // Case 1: The operand slot of I that receives our value does NOT require S.
-  //   → I operates purely on WideTy and doesn't need the value bounded in S.
-  //   → return FALSE
-  //
-  // Case 2: The S-requirement of I's input == the type of I's output.
-  //   → I propagates the wide value forward (e.g. add i64, phi i64).
-  //   → Walk DU-chain of I's output: if any downstream user needs S → TRUE
-  //   → return FALSE if none do
-  //
-  // Default / Case 3: conservative → return TRUE
-  // -----------------------------------------------------------------------
-  bool AnalyzeUSE(Instruction *SXT, Instruction *I) {
-    // Cycle detection (USE flag)
-    if (VisitedUSE.count(I))
-      return false;
-    VisitedUSE.insert(I);
+    print_logs(blocks, zexts);
 
-    // ------------------------------------------------------------------
-    // icmp: both operands are WideTy → no slot requires S → Case 1 → FALSE
-    //       any operand is ShortTy  → slot requires S → TRUE
-    // ------------------------------------------------------------------
-    if (auto *ICmp = dyn_cast<ICmpInst>(I)) {
-      Value *Op0 = ICmp->getOperand(0);
-      Value *Op1 = ICmp->getOperand(1);
-      if (Op0->getType() == WideTy && Op1->getType() == WideTy)
-        return false; // Case 1: wide comparison, no S requirement
-      return true;    // one side is narrow → requires S
-    }
-
-    // ------------------------------------------------------------------
-    // Binary arithmetic on WideTy (add/sub/mul/and/or/xor/shifts/div/rem):
-    //   Input slots are WideTy → no S requirement on input → but
-    //   the result propagates forward → Case 2: walk users of result.
-    // ------------------------------------------------------------------
-    if (auto *BinOp = dyn_cast<BinaryOperator>(I)) {
-      if (BinOp->getType() == WideTy) {
-        // Case 2: S-requirement propagates through to users of BinOp
-        for (User *U : BinOp->users())
-          if (auto *J = dyn_cast<Instruction>(U))
-            if (AnalyzeUSE(SXT, J))
-              return true;
-        return false;
-      }
-      // BinOp produces ShortTy → output requires S → TRUE
-      return true;
-    }
-
-    // ------------------------------------------------------------------
-    // PHI node on WideTy: propagates value forward → Case 2
-    // PHI node on ShortTy: output requires S → TRUE
-    // ------------------------------------------------------------------
-    if (auto *PHI = dyn_cast<PHINode>(I)) {
-      if (PHI->getType() == WideTy) {
-        for (User *U : PHI->users())
-          if (auto *J = dyn_cast<Instruction>(U))
-            if (AnalyzeUSE(SXT, J))
-              return true;
-        return false; // Case 2: none of the downstream users needed S
-      }
-      return true; // PHI produces ShortTy → requires S
-    }
-
-    // ------------------------------------------------------------------
-    // Store: storing a WideTy value — the slot type is WideTy, no S req
-    //   → Case 1 → FALSE
-    // ------------------------------------------------------------------
-    if (auto *Store = dyn_cast<StoreInst>(I)) {
-      if (Store->getValueOperand()->getType() == WideTy)
-        return false; // Case 1
-      return true;
-    }
-
-    // ------------------------------------------------------------------
-    // Return: returning WideTy — no S requirement → Case 1 → FALSE
-    // ------------------------------------------------------------------
-    if (auto *Ret = dyn_cast<ReturnInst>(I)) {
-      if (Ret->getReturnValue() && Ret->getReturnValue()->getType() == WideTy)
-        return false; // Case 1
-      return true;
-    }
-
-    // ------------------------------------------------------------------
-    // TruncInst back to ShortTy: this IS consuming S → TRUE
-    // TruncInst to other type: walk its users (Case 2)
-    // ------------------------------------------------------------------
-    if (auto *Trunc = dyn_cast<TruncInst>(I)) {
-      if (Trunc->getDestTy() == ShortTy)
-        return true; // narrowing to S — requires S
-      // Truncating to some other width: propagate forward
-      for (User *U : Trunc->users())
-        if (auto *J = dyn_cast<Instruction>(U))
-          if (AnalyzeUSE(SXT, J))
-            return true;
-      return false;
-    }
-
-    // ------------------------------------------------------------------
-    // ZExtInst / SExtInst re-extending from WideTy: input slot is WideTy
-    //   → no S requirement → Case 1 → FALSE
-    // ------------------------------------------------------------------
-    if (auto *ZE = dyn_cast<ZExtInst>(I))
-      if (ZE->getSrcTy() == WideTy)
-        return false;
-    if (auto *SE = dyn_cast<SExtInst>(I))
-      if (SE->getSrcTy() == WideTy)
-        return false;
-
-    // ------------------------------------------------------------------
-    // Call: if the argument slot receiving our value is WideTy → Case 1
-    // Conservative fallback if we can't determine → TRUE
-    // ------------------------------------------------------------------
-    if (auto *Call = dyn_cast<CallInst>(I)) {
-      for (unsigned i = 0; i < Call->arg_size(); ++i)
-        if (Call->getArgOperand(i)->getType() == WideTy)
-          return false; // Case 1: arg slot is wide, no S requirement
-      return true;
-    }
-
-    // Default / Case 3 (AnalyzeARRAY omitted): conservative
-    return true;
-  }
-
-  // -----------------------------------------------------------------------
-  // AnalyzeDEF(I) — Fig. 12
-  //
-  // Walks BACKWARD through the UD-chain from SXT's source.
-  //
-  // FALSE = zext unnecessary (source already zero-extended / wide enough)
-  // TRUE  = zext necessary
-  // -----------------------------------------------------------------------
-  bool AnalyzeDEF(Instruction *I) {
-    // Cycle detection (DEF flag)
-    if (VisitedDEF.count(I))
-      return false;
-    VisitedDEF.insert(I);
-
-    Type *DestTy = I->getType();
-
-    // Case 1: I produces the narrow type S → the value lives in S here
-    //         The zext is therefore not provably redundant from this side
-    if (DestTy == ShortTy)
-      return false;
-
-    // Case 2: dest type == src type of I (same-width, e.g. add i64, phi i64)
-    //         Walk further back through UD-chain
-    bool hasSameTypeOperand = false;
-    for (unsigned i = 0; i < I->getNumOperands(); ++i) {
-      Value *Op = I->getOperand(i);
-      if (Op->getType() != DestTy)
+    for (ZExtInst *ZXT : zexts) {
+      if (!ZXT->getParent())
         continue;
-      hasSameTypeOperand = true;
-      if (auto *J = dyn_cast<Instruction>(Op))
-        if (AnalyzeDEF(J))
-          return true;
-    }
-    if (hasSameTypeOperand)
-      return false;
 
-    // Default: I has no same-type operand (e.g. I is itself a zext/sext)
-    // → value was already extended → zext on top is redundant → TRUE
-    return true;
+      // if (TryConvertZExtToSExt(ZXT)) {
+      //   Changed = true;
+      //   continue;
+      // }
+
+      Changed |= EliminateOneExtend(ZXT);
+    }
+
+    return Changed;
   }
 
-  // -----------------------------------------------------------------------
-  // EliminateOneExtend — Fig. 11 (exact order from paper)
-  // -----------------------------------------------------------------------
-  bool EliminateOneExtend(ZExtInst *ZExt) {
-    VisitedUSE.clear();
-    VisitedDEF.clear();
 
-    Value *Src   = ZExt->getOperand(0);
-    Type  *SrcTy = Src->getType();     // ShortTy S, e.g. i32
-    Type  *DstTy = ZExt->getDestTy();  // WideTy,   e.g. i64
+private:
+  Function &F;
+  const DataLayout &DL;
+  BlockFrequencyInfo &BFI;
 
-    ShortTy = SrcTy;
-    WideTy  = DstTy;
+  struct AnalyzeState {
+    DenseSet<std::pair<const Instruction *, const Value *>> USE;
+    DenseSet<const Instruction*> DEF;
+    bool SawGEP = false;
+    bool SawTruncSink = false;
+  };
 
-    bool Required = false;
+  struct BuildState {
+    DenseMap<Value *, Value *> Cache;
+  };
 
-    // ------------------------------------------------------------------
-    // Step 1 (Fig. 11): DU-chain — AnalyzeUSE
-    // "for I = all instructions that use the destination operand of SXT"
-    // ------------------------------------------------------------------
-    for (User *U : ZExt->users()) {
-      if (auto *I = dyn_cast<Instruction>(U)) {
-        Required = AnalyzeUSE(ZExt, I);
-        if (Required) break;
-      }
+  static bool isDEFChainOpcode(unsigned Opcode) {
+    switch (Opcode) {
+    case Instruction::Add:
+    case Instruction::Sub:
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+
+  std::vector<std::pair<BasicBlock*, uint64_t>> getBasicBlocksHotness() {
+    std::vector<std::pair<BasicBlock*, uint64_t>> blocks;
+
+    for (BasicBlock &BB : F) {
+      uint64_t freq = BFI.getBlockFreq(&BB).getFrequency();
+      blocks.push_back({&BB, freq});
     }
 
-    // ------------------------------------------------------------------
-    // Step 2 (Fig. 11): UD-chain — AnalyzeDEF (only if still not required)
-    // "for I = all instructions that define the source operand of SXT"
-    // In SSA: exactly one defining instruction (or arg / constant).
-    // ------------------------------------------------------------------
-    if (!Required) {
-      if (auto *SrcInst = dyn_cast<Instruction>(Src)) {
-        Required = AnalyzeDEF(SrcInst);
-      } else if (isa<Argument>(Src)) {
-        // Argument: unknown value from caller — conservative, treat as required
-        Required = true;
-      } else if (isa<ConstantInt>(Src) || isa<UndefValue>(Src) ||
-                 isa<PoisonValue>(Src)) {
-        Required = false; // constants never need extension
-      }
-    }
+    std::sort(blocks.begin(), blocks.end(),
+          [](const auto &a, const auto &b) {
+            return a.second > b.second;
+          });
 
-    if (Required)
-      return false; // keep the zext
+    return blocks;
+  }
 
-    // ------------------------------------------------------------------
-    // Step 3: Eliminate.
-    //
-    // Users fall into three buckets:
-    //   TruncToSrc  : trunc(zext(x)) to SrcTy   → replace with Src
-    //   TruncToOther: trunc(zext(x)) to T≠SrcTy → replace with trunc(Src,T)
-    //   OtherUsers  : still need DstTy (i64)     → rebuild zext from Src
-    //                 (AnalyzeUSE confirmed they don't need S, so the new
-    //                  zext is semantically identical — trunc waste removed)
-    // ------------------------------------------------------------------
-    SmallVector<TruncInst *, 4> TruncToSrcUsers;
-    SmallVector<TruncInst *, 4> TruncToOtherUsers;
-    SmallVector<Instruction *, 4> OtherUsers;
+  bool TryConvertZExtToSExt(ZExtInst *ZExt) {
+    auto *SrcTy = dyn_cast<IntegerType>(ZExt->getSrcTy());
+    auto *DstTy = dyn_cast<IntegerType>(ZExt->getDestTy());
+    if (!SrcTy || !DstTy)
+      return false;
 
-    for (User *U : ZExt->users()) {
-      auto *UI = dyn_cast<Instruction>(U);
-      if (!UI) continue;
-      if (auto *Trunc = dyn_cast<TruncInst>(UI)) {
-        if (Trunc->getDestTy() == SrcTy)
-          TruncToSrcUsers.push_back(Trunc);
-        else
-          TruncToOtherUsers.push_back(Trunc);
-      } else {
-        OtherUsers.push_back(UI);
-      }
-    }
+    unsigned SrcBits = SrcTy->getBitWidth();
+    if (SrcBits == 0)
+      return false;
 
-    // trunc(zext(x)) → x
-    for (auto *Trunc : TruncToSrcUsers) {
-      Trunc->replaceAllUsesWith(Src);
-      Trunc->eraseFromParent();
-    }
+    Value *Src = ZExt->getOperand(0);
 
-    // trunc(zext(x), T) → trunc(x, T)
-    for (auto *Trunc : TruncToOtherUsers) {
-      IRBuilder<> Builder(Trunc);
-      Value *New = Builder.CreateTrunc(Src, Trunc->getDestTy(),
-                                       Trunc->getName());
-      Trunc->replaceAllUsesWith(New);
-      Trunc->eraseFromParent();
-    }
+    KnownBits KB = computeKnownBits(Src, DL, 0, nullptr, ZExt, nullptr);
+    if (!KB.Zero[SrcBits - 1])
+      return false;
 
-    if (!OtherUsers.empty()) {
-      IRBuilder<> Builder(ZExt);
-      Value *NewZExt = Builder.CreateZExt(Src, DstTy, ZExt->getName());
-      ZExt->replaceAllUsesWith(NewZExt);
-      ZExt->eraseFromParent();
-      return !TruncToSrcUsers.empty() || !TruncToOtherUsers.empty();
-    }
+    IRBuilder<> B(ZExt);
+    Value *SExt = B.CreateSExt(Src, DstTy, ZExt->getName() + ".sext");
 
-    // No other users — erase cleanly
+    ZExt->replaceAllUsesWith(SExt);
     ZExt->eraseFromParent();
     return true;
   }
-};
 
-//===----------------------------------------------------------------------===//
-// Legacy Pass Manager
-//===----------------------------------------------------------------------===//
-class KawahitoZextAlgorithm : public FunctionPass {
-public:
-  static char ID;
-  KawahitoZextAlgorithm() : FunctionPass(ID) {}
+  bool ConvertZExtToSExt(ZExtInst *ZExt) {
+    auto *DstTy = dyn_cast<IntegerType>(ZExt->getDestTy());
+    if (!DstTy)
+      return false;
 
-  bool runOnFunction(Function &F) override {
-    bool Changed = false;
-    SmallVector<ZExtInst *, 32> ZExts;
-    for (auto &BB : F)
-      for (auto &I : BB)
-        if (auto *ZExt = dyn_cast<ZExtInst>(&I))
-          ZExts.push_back(ZExt);
+    IRBuilder<> B(ZExt);
+    Value *SExt =
+        B.CreateSExt(ZExt->getOperand(0), DstTy, ZExt->getName() + ".sext");
+    ZExt->replaceAllUsesWith(SExt);
+    ZExt->eraseFromParent();
+    return true;
+  }
 
-    KawahitoAnalyzer Analyzer;
-    for (auto *ZExt : ZExts)
-      if (ZExt->getParent())
-        if (Analyzer.EliminateOneExtend(ZExt))
-          Changed = true;
 
-    return Changed;
+
+  bool isCandidateZext(ZExtInst *ZExt) {
+    Type *DstTy = ZExt->getType();
+    return DstTy->isIntegerTy(64);
+  }
+
+  std::vector<ZExtInst*> getZExtInstructions(
+    const std::vector<std::pair<BasicBlock*, uint64_t>> &blocks) {
+    std::vector<ZExtInst*> zexts;
+
+    for (auto &[BB, freq] : blocks) {
+      for (Instruction &I : *BB) {
+        if (auto *ZExt = dyn_cast<ZExtInst>(&I)) {
+          if (isCandidateZext(ZExt))
+          zexts.push_back(ZExt);
+        }
+      }
+    }
+
+    return zexts;
+  }
+
+  static bool areUpperBitsKnownZero(Value *V, unsigned RootBits,
+                                    const DataLayout &DL,
+                                    Instruction *Ctx) {
+    auto *IntTy = dyn_cast<IntegerType>(V->getType());
+    if (!IntTy)
+      return false;
+
+    unsigned BitWidth = IntTy->getBitWidth();
+    if (RootBits >= BitWidth)
+      return false;
+
+    KnownBits KB = computeKnownBits(V, DL, 0, nullptr, Ctx, nullptr);
+    for (unsigned Bit = RootBits; Bit < BitWidth; ++Bit) {
+      if (!KB.Zero[Bit])
+        return false;
+    }
+
+    return true;
+  }
+
+  static bool areUpperBitsKnownOne(Value *V, unsigned RootBits,
+                                   const DataLayout &DL,
+                                   Instruction *Ctx) {
+    auto *IntTy = dyn_cast<IntegerType>(V->getType());
+    if (!IntTy)
+      return false;
+
+    unsigned BitWidth = IntTy->getBitWidth();
+    if (RootBits >= BitWidth)
+      return false;
+
+    KnownBits KB = computeKnownBits(V, DL, 0, nullptr, Ctx, nullptr);
+    for (unsigned Bit = RootBits; Bit < BitWidth; ++Bit) {
+      if (!KB.One[Bit])
+        return false;
+    }
+
+    return true;
+  }
+
+  bool hasZeroUpperBitsForZExt(ZExtInst *ZExt, Value *V,
+                               Instruction *Ctx) const {
+    auto *WideTy = dyn_cast<IntegerType>(ZExt->getType());
+    auto *ValueTy = dyn_cast<IntegerType>(V->getType());
+    if (!WideTy || !ValueTy || ValueTy != WideTy)
+      return false;
+
+    auto *RootTy = cast<IntegerType>(ZExt->getSrcTy());
+    return areUpperBitsKnownZero(V, RootTy->getBitWidth(), DL, Ctx);
+  }
+
+  enum class UseSinkKind {
+    RequiresZExt,
+    Garbage,
+    ZS,
+  };
+
+  UseSinkKind classifyUseSink(ZExtInst *ZExt, Value *CurrentValue,
+                              Instruction *I) {
+    auto *SrcTy = dyn_cast<IntegerType>(ZExt->getSrcTy());
+    if (!SrcTy)
+      return UseSinkKind::RequiresZExt; // conservative
+
+    unsigned RootBits = SrcTy->getBitWidth();
+
+    // Case 1:
+    // valid trunc sink means this use-path does not require the zext.
+    if (auto *Trunc = dyn_cast<TruncInst>(I)) {
+      auto *DstTy = dyn_cast<IntegerType>(Trunc->getDestTy());
+      if (!DstTy)
+        return UseSinkKind::RequiresZExt;
+
+      if (DstTy->getBitWidth() <= RootBits)
+        return UseSinkKind::Garbage;
+    }
+
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      Value *Other = nullptr;
+      if (BO->getOperand(0) == CurrentValue && BO->getOperand(1) != CurrentValue)
+        Other = BO->getOperand(1);
+      else if (BO->getOperand(1) == CurrentValue && BO->getOperand(0) != CurrentValue)
+        Other = BO->getOperand(0);
+
+      if (Other) {
+        switch (BO->getOpcode()) {
+        case Instruction::And:
+          if (areUpperBitsKnownZero(Other, RootBits, DL, I))
+            return UseSinkKind::ZS;
+          break;
+        case Instruction::Or:
+          if (areUpperBitsKnownOne(Other, RootBits, DL, I))
+            return UseSinkKind::ZS;
+          break;
+        default:
+          break;
+        }
+      }
+    }
+
+    return UseSinkKind::RequiresZExt;
+  }
+
+
+  static bool isCase2Instruction(Instruction *I) {
+    if (isa<PHINode>(I))
+      return true;
+
+    if (isa<SelectInst>(I))
+      return true;
+
+    if (isa<GetElementPtrInst>(I))
+      return true;
+
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      // Case 2 only recurses through ops whose low RootBits remain a function of
+      // the incoming low RootBits alone. Comparisons, right shifts, and
+      // division/remainder do not satisfy that property generically in LLVM IR.
+      // Flagged mul is also excluded: replacing zext with sext can change LLVM
+      // poison semantics even when later low-bit uses look safe.
+      switch (BO->getOpcode()) {
+        case Instruction::Add:
+        case Instruction::Sub:
+        case Instruction::And:
+        case Instruction::Or:
+        case Instruction::Xor:
+        case Instruction::Shl:
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    return false;
+  }
+
+  bool AnalyzeUSE(ZExtInst *ZExt, Instruction *I, AnalyzeState &State) {
+    // USE flag: already visited for this ZExt
+    return AnalyzeUSE(ZExt, ZExt, I, State);
+  }
+
+  bool AnalyzeUSE(ZExtInst *ZExt, Value *CurrentValue, Instruction *I,
+                  AnalyzeState &State) {
+    if (!State.USE.insert({I, CurrentValue}).second)
+      return false;
+
+    if (isa<GetElementPtrInst>(I))
+      State.SawGEP = true;
+
+    // Case 1:
+    // current use does not require zext
+    switch (classifyUseSink(ZExt, CurrentValue, I)) {
+    case UseSinkKind::Garbage:
+      State.SawTruncSink = true;
+      return false;
+    case UseSinkKind::ZS:
+      return false;
+    case UseSinkKind::RequiresZExt:
+      break;
+    }
+
+    // Case 2:
+    // recurse on all users of I
+    if (isCase2Instruction(I)) {
+      for (User *U : I->users()) {
+        auto *UserI = dyn_cast<Instruction>(U);
+        if (!UserI)
+          return true; // conservative
+
+        if (AnalyzeUSE(ZExt, I, UserI, State))
+          return true;
+      }
+
+      return false;
+    }
+
+    // Default:
+    // this use still requires the zext
+    return true;
+  }
+
+/*
+  bool rewriteToNarrow(ZExtInst *ZExt) {
+  Type *RootTy = ZExt->getSrcTy();
+
+  DenseMap<Value *, Value *> NarrowMap;
+  SmallVector<Instruction *, 16> Worklist;
+  SmallVector<Instruction *, 16> Dead;
+
+  NarrowMap[ZExt] = ZExt->getOperand(0);
+
+  auto getNarrow = [&](Value *V, IRBuilder<> &B) -> Value * {
+    if (Value *N = NarrowMap.lookup(V))
+      return N;
+
+    if (Constant *C = dyn_cast<Constant>(V))
+      return ConstantExpr::getTruncOrBitCast(C, RootTy);
+
+    return nullptr;
+  };
+
+  auto getNarrowIncoming = [&](Value *V) -> Value * {
+    if (Value *N = NarrowMap.lookup(V))
+      return N;
+
+    if (Constant *C = dyn_cast<Constant>(V))
+      return ConstantExpr::getTruncOrBitCast(C, RootTy);
+
+    return nullptr;
+  };
+
+  for (User *U : ZExt->users()) {
+    if (Instruction *I = dyn_cast<Instruction>(U))
+      Worklist.push_back(I);
+    else
+      return false;
+  }
+
+  while (!Worklist.empty()) {
+    Instruction *I = Worklist.pop_back_val();
+
+    if (auto *TI = dyn_cast<TruncInst>(I)) {
+      Value *Narrow = NarrowMap.lookup(TI->getOperand(0));
+      if (!Narrow)
+        return false;
+
+      Value *Replacement = Narrow;
+
+      if (TI->getDestTy() != Narrow->getType()) {
+        IRBuilder<> B(TI);
+        Replacement = B.CreateTrunc(Narrow, TI->getDestTy());
+      }
+
+      TI->replaceAllUsesWith(Replacement);
+      Dead.push_back(TI);
+      continue;
+    }
+
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      IRBuilder<> B(BO);
+
+      Value *L = getNarrow(BO->getOperand(0), B);
+      Value *R = getNarrow(BO->getOperand(1), B);
+
+      if (!L || !R)
+        return false;
+
+      Value *N = B.CreateBinOp(BO->getOpcode(), L, R);
+
+      NarrowMap[BO] = N;
+      Dead.push_back(BO);
+
+      for (User *U : BO->users()) {
+        if (Instruction *UserI = dyn_cast<Instruction>(U))
+          Worklist.push_back(UserI);
+        else
+          return false;
+      }
+
+      continue;
+    }
+
+    if (auto *PN = dyn_cast<PHINode>(I)) {
+      PHINode *NewPhi =
+          PHINode::Create(RootTy, PN->getNumIncomingValues(), "", PN);
+
+      NarrowMap[PN] = NewPhi;
+      Dead.push_back(PN);
+
+      for (unsigned k = 0; k < PN->getNumIncomingValues(); ++k) {
+        Value *In = PN->getIncomingValue(k);
+        BasicBlock *Pred = PN->getIncomingBlock(k);
+
+        Value *NIn = getNarrowIncoming(In);
+        if (!NIn)
+          return false;
+
+        NewPhi->addIncoming(NIn, Pred);
+      }
+
+      for (User *U : PN->users()) {
+        if (Instruction *UserI = dyn_cast<Instruction>(U))
+          Worklist.push_back(UserI);
+        else
+          return false;
+      }
+
+      continue;
+    }
+
+    return false;
+  }
+
+  for (Instruction *I : reverse(Dead)) {
+    if (I->use_empty())
+      I->eraseFromParent();
+  }
+
+  if (ZExt->use_empty())
+    ZExt->eraseFromParent();
+
+  return true;
+} */
+/*
+	bool AnalyzeDEFValue(ZExtInst *ZExt, Value *V, AnalyzeState &State) {
+    auto *RootTy = cast<IntegerType>(ZExt->getSrcTy());
+
+    if (auto *CI = dyn_cast<ConstantInt>(V)) {
+      if (CI->getType() == RootTy)
+        return false;
+
+      return !hasZeroUpperBitsForZExt(ZExt, CI, nullptr);
+    }
+
+    if (!isa<Instruction>(V))
+      return true;
+
+    return AnalyzeDEF(ZExt, cast<Instruction>(V), State);
+  }
+
+
+ bool AnalyzeDEF(ZExtInst *ZExt, Instruction *I, AnalyzeState &State) {
+    if (!State.DEF.insert(I).second) {
+      return false;
+    }
+
+    auto *RootTy = cast<IntegerType>(ZExt->getSrcTy());
+
+    // Case 1:
+	    if (auto *PrevZExt = dyn_cast<ZExtInst>(I)) {
+	      if (PrevZExt->getType() == ZExt->getType())
+	        return false;
+
+        return AnalyzeDEFValue(ZExt, PrevZExt->getOperand(0), State);
+	    }
+
+	    if (auto *TI = dyn_cast<TruncInst>(I)) {
+	      if (hasZeroUpperBitsForZExt(ZExt, TI->getOperand(0), TI))
+	        return false;
+
+	      return AnalyzeDEFValue(ZExt, TI->getOperand(0), State);
+	    }
+
+    if (auto *SExt = dyn_cast<SExtInst>(I)) {
+      if (SExt->getType() == ZExt->getType() &&
+          SExt->getSrcTy() == RootTy &&
+          hasZeroUpperBitsForZExt(ZExt, SExt, SExt))
+        return false;
+
+      return AnalyzeDEFValue(ZExt, SExt->getOperand(0), State);
+    }
+
+	    if (auto *PN = dyn_cast<PHINode>(I)) {
+        if (PN->getType() == ZExt->getType() &&
+            hasZeroUpperBitsForZExt(ZExt, PN, PN))
+          return false;
+
+	      for (unsigned k = 0; k < PN->getNumIncomingValues(); ++k) {
+	        if (AnalyzeDEFValue(ZExt, PN->getIncomingValue(k), State))
+	          return true;
+      }
+      return false;
+    }
+
+	    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+        auto *WideTy = cast<IntegerType>(ZExt->getType());
+        if (BO->getType() != WideTy || !isDEFChainOpcode(BO->getOpcode()))
+          return true;
+
+        if (hasZeroUpperBitsForZExt(ZExt, BO, BO))
+          return false;
+
+        if (AnalyzeDEFValue(ZExt, BO->getOperand(0), State))
+          return true;
+        if (AnalyzeDEFValue(ZExt, BO->getOperand(1), State))
+          return true;
+        return false;
+	    }
+
+	    return true;
+	  }
+
+	  Value *BuildDEFReplacementValue(ZExtInst *ZExt, Value *V, BuildState &State) {
+	    if (Value *Cached = State.Cache.lookup(V))
+	      return Cached;
+
+	    auto *RootTy = cast<IntegerType>(ZExt->getSrcTy());
+	    auto *WideTy = cast<IntegerType>(ZExt->getType());
+
+	    if (auto *CI = dyn_cast<ConstantInt>(V)) {
+        if (CI->getType() == RootTy)
+          return ConstantInt::get(WideTy,
+                                  CI->getValue().zext(WideTy->getBitWidth()));
+        if (hasZeroUpperBitsForZExt(ZExt, CI, nullptr))
+          return CI;
+        return nullptr;
+	    }
+
+	    if (isa<Argument>(V))
+      return nullptr;
+
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I)
+      return nullptr;
+
+	    if (auto *PrevZExt = dyn_cast<ZExtInst>(I)) {
+	      if (PrevZExt->getType() == WideTy)
+	        return PrevZExt;
+
+        return BuildDEFReplacementValue(ZExt, PrevZExt->getOperand(0), State);
+	    }
+
+	    if (auto *TI = dyn_cast<TruncInst>(I)) {
+        if (hasZeroUpperBitsForZExt(ZExt, TI->getOperand(0), TI))
+          return TI->getOperand(0);
+
+	      return BuildDEFReplacementValue(ZExt, TI->getOperand(0), State);
+	    }
+
+    if (auto *SExt = dyn_cast<SExtInst>(I)) {
+      if (SExt->getType() == WideTy && SExt->getSrcTy() == RootTy &&
+          hasZeroUpperBitsForZExt(ZExt, SExt, SExt))
+        return SExt;
+
+      return BuildDEFReplacementValue(ZExt, SExt->getOperand(0), State);
+    }
+
+	    if (auto *PN = dyn_cast<PHINode>(I)) {
+        if (PN->getType() == WideTy && hasZeroUpperBitsForZExt(ZExt, PN, PN))
+          return PN;
+
+	      PHINode *WidePhi =
+	          PHINode::Create(WideTy, PN->getNumIncomingValues(),
+                          PN->getName() + ".kz.wide", PN);
+      State.Cache[PN] = WidePhi;
+
+      for (unsigned K = 0; K < PN->getNumIncomingValues(); ++K) {
+        Value *Incoming =
+            BuildDEFReplacementValue(ZExt, PN->getIncomingValue(K), State);
+        if (!Incoming) {
+          State.Cache.erase(PN);
+          WidePhi->eraseFromParent();
+          return nullptr;
+        }
+        WidePhi->addIncoming(Incoming, PN->getIncomingBlock(K));
+      }
+
+      return WidePhi;
+    }
+
+	    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+        if (BO->getType() != WideTy || !isDEFChainOpcode(BO->getOpcode()))
+          return nullptr;
+
+        if (hasZeroUpperBitsForZExt(ZExt, BO, BO))
+          return BO;
+
+	      Value *L = BuildDEFReplacementValue(ZExt, BO->getOperand(0), State);
+	      Value *R = BuildDEFReplacementValue(ZExt, BO->getOperand(1), State);
+      if (!L || !R)
+        return nullptr;
+
+      IRBuilder<> B(ZExt);
+      Value *Wide =
+          B.CreateBinOp(BO->getOpcode(), L, R, BO->getName() + ".kz.wide");
+      State.Cache[BO] = Wide;
+      return Wide;
+    }
+
+    return nullptr;
+  }
+
+  bool EliminateByDEF(ZExtInst *ZExt) {
+    BuildState State;
+    Value *Replacement = BuildDEFReplacementValue(ZExt, ZExt->getOperand(0), State);
+    if (!Replacement || Replacement->getType() != ZExt->getType())
+      return false;
+
+    ZExt->replaceAllUsesWith(Replacement);
+    ZExt->eraseFromParent();
+    return true;
+  }
+*/
+
+
+	  bool EliminateOneExtend(ZExtInst *ZExt) {
+	    AnalyzeState State;
+	    bool Required = false;
+
+    for (User *U : ZExt->users()) {
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI) {
+        Required = true;
+        break;
+      }
+
+      Required = AnalyzeUSE(ZExt, UI, State);
+      if (Required)
+        break;
+    }
+
+    if (!Required) {
+      if (State.SawGEP && State.SawTruncSink) {
+        errs() << "zext kept due to GEP + trunc sink path: " << *ZExt << "\n";
+        return false;
+      }
+
+      errs() << "zext can be eliminated by USE: " << *ZExt << "\n";
+      return ConvertZExtToSExt(ZExt);
+    }
+
+   /* Required = AnalyzeDEFValue(ZExt, ZExt->getOperand(0), State);
+
+	    if (!Required) {
+	      errs() << "zext can be eliminated by DEF: " << *ZExt << "\n";
+	      return EliminateByDEF(ZExt);
+	    }
+*/
+/*
+      if (TryConvertZExtToSExt(ZExt)) {
+        errs() << "zext can be converted to sext by KnownBits\n";
+        return true;
+      } */
+
+	    errs() << "zext is still required: " << *ZExt << "\n";
+	    return false;
+	  }
+
+
+
+  void print_logs(
+      const std::vector<std::pair<BasicBlock*, uint64_t>> &hotness, std::vector<ZExtInst*> zexts) {
+
+      errs() << "\n=== Function: " << F.getName() << " ===\n";
+
+      for (auto &[BB, freq] : hotness) {
+        errs() << "BasicBlock: ";
+        BB->printAsOperand(errs(), false);
+        errs() << " hotness=" << freq << "\n";
+      }
+
+      for (ZExtInst *I : zexts){
+          errs() << *I << "\n";
+      }
   }
 };
 
 } // namespace
 
-char KawahitoZextAlgorithm::ID = 0;
-
-INITIALIZE_PASS(KawahitoZextAlgorithm, "kawahito-zext",
-                "Eliminate redundant zext using Kawahito algorithm", false, false)
-
-namespace llvm {
-FunctionPass *createKawahitoZextAlgorithmPass() {
-  return new KawahitoZextAlgorithm();
-}
-} // namespace llvm
-
-//===----------------------------------------------------------------------===//
-// New Pass Manager
-//===----------------------------------------------------------------------===//
 PreservedAnalyses KawahitoZextAlgorithmPass::run(Function &F,
-                                                  FunctionAnalysisManager &AM) {
-  bool Changed = false;
-  SmallVector<ZExtInst *, 32> ZExts;
-  for (auto &BB : F)
-    for (auto &I : BB)
-      if (auto *ZExt = dyn_cast<ZExtInst>(&I))
-        ZExts.push_back(ZExt);
-
-  KawahitoAnalyzer Analyzer;
-  for (auto *ZExt : ZExts)
-    if (ZExt->getParent())
-      if (Analyzer.EliminateOneExtend(ZExt))
-        Changed = true;
+                                                 FunctionAnalysisManager &AM) {
+  
+  BlockFrequencyInfo &BFI = AM.getResult<BlockFrequencyAnalysis>(F);                                               
+  EliminateRedundantZext Pass(F, BFI);
+  bool Changed = Pass.run();
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

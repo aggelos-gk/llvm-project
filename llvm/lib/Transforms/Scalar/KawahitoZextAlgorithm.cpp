@@ -54,10 +54,8 @@ private:
   BlockFrequencyInfo &BFI;
 
   struct AnalyzeState {
-    DenseSet<std::pair<const Instruction *, const Value *>> USE;
+    DenseMap<const Value *, DenseSet<const Instruction *>> USE;
     DenseSet<const Instruction*> DEF;
-    bool SawGEP = false;
-    bool SawTruncSink = false;
   };
 
   struct BuildState {
@@ -135,7 +133,8 @@ private:
 
   bool isCandidateZext(ZExtInst *ZExt) {
     Type *DstTy = ZExt->getType();
-    return DstTy->isIntegerTy(64);
+    return DstTy->isIntegerTy(16) || DstTy->isIntegerTy(32) ||
+           DstTy->isIntegerTy(64);
   }
 
   std::vector<ZExtInst*> getZExtInstructions(
@@ -205,17 +204,10 @@ private:
     return areUpperBitsKnownZero(V, RootTy->getBitWidth(), DL, Ctx);
   }
 
-  enum class UseSinkKind {
-    RequiresZExt,
-    Garbage,
-    ZS,
-  };
-
-  UseSinkKind classifyUseSink(ZExtInst *ZExt, Value *CurrentValue,
-                              Instruction *I) {
+  bool isUseSink(ZExtInst *ZExt, Value *Current, Instruction *I) {
     auto *SrcTy = dyn_cast<IntegerType>(ZExt->getSrcTy());
     if (!SrcTy)
-      return UseSinkKind::RequiresZExt; // conservative
+      return false; // conservative
 
     unsigned RootBits = SrcTy->getBitWidth();
 
@@ -224,28 +216,28 @@ private:
     if (auto *Trunc = dyn_cast<TruncInst>(I)) {
       auto *DstTy = dyn_cast<IntegerType>(Trunc->getDestTy());
       if (!DstTy)
-        return UseSinkKind::RequiresZExt;
+        return false;
 
       if (DstTy->getBitWidth() <= RootBits)
-        return UseSinkKind::Garbage;
+        return true;
     }
 
     if (auto *BO = dyn_cast<BinaryOperator>(I)) {
       Value *Other = nullptr;
-      if (BO->getOperand(0) == CurrentValue && BO->getOperand(1) != CurrentValue)
+      if (BO->getOperand(0) == Current && BO->getOperand(1) != Current)
         Other = BO->getOperand(1);
-      else if (BO->getOperand(1) == CurrentValue && BO->getOperand(0) != CurrentValue)
+      else if (BO->getOperand(1) == Current && BO->getOperand(0) != Current)
         Other = BO->getOperand(0);
 
       if (Other) {
         switch (BO->getOpcode()) {
         case Instruction::And:
           if (areUpperBitsKnownZero(Other, RootBits, DL, I))
-            return UseSinkKind::ZS;
+            return true;
           break;
         case Instruction::Or:
           if (areUpperBitsKnownOne(Other, RootBits, DL, I))
-            return UseSinkKind::ZS;
+            return true;
           break;
         default:
           break;
@@ -253,7 +245,7 @@ private:
       }
     }
 
-    return UseSinkKind::RequiresZExt;
+    return false;
   }
 
 
@@ -289,30 +281,17 @@ private:
     return false;
   }
 
-  bool AnalyzeUSE(ZExtInst *ZExt, Instruction *I, AnalyzeState &State) {
-    // USE flag: already visited for this ZExt
-    return AnalyzeUSE(ZExt, ZExt, I, State);
-  }
-
-  bool AnalyzeUSE(ZExtInst *ZExt, Value *CurrentValue, Instruction *I,
+  bool AnalyzeUSE(ZExtInst *ZExt, Value *Current, Instruction *I,
                   AnalyzeState &State) {
-    if (!State.USE.insert({I, CurrentValue}).second)
+    // USE flag: already visited for this current path value.
+    DenseSet<const Instruction *> &VisitedUsers = State.USE[Current];
+    if (!VisitedUsers.insert(I).second)
       return false;
-
-    if (isa<GetElementPtrInst>(I))
-      State.SawGEP = true;
 
     // Case 1:
     // current use does not require zext
-    switch (classifyUseSink(ZExt, CurrentValue, I)) {
-    case UseSinkKind::Garbage:
-      State.SawTruncSink = true;
+    if (isUseSink(ZExt, Current, I))
       return false;
-    case UseSinkKind::ZS:
-      return false;
-    case UseSinkKind::RequiresZExt:
-      break;
-    }
 
     // Case 2:
     // recurse on all users of I
@@ -649,17 +628,12 @@ private:
         break;
       }
 
-      Required = AnalyzeUSE(ZExt, UI, State);
+      Required = AnalyzeUSE(ZExt, ZExt, UI, State);
       if (Required)
         break;
     }
 
     if (!Required) {
-      if (State.SawGEP && State.SawTruncSink) {
-        errs() << "zext kept due to GEP + trunc sink path: " << *ZExt << "\n";
-        return false;
-      }
-
       errs() << "zext can be eliminated by USE: " << *ZExt << "\n";
       return ConvertZExtToSExt(ZExt);
     }

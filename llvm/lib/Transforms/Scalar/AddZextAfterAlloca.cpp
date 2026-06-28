@@ -35,6 +35,7 @@ private:
   Function &F;
   DenseMap<Value *, Value *> WideMap;
   DenseMap<Instruction *, Value *> TruncMap;
+  DenseMap<Value *, Value *> ZExtTruncMap;
   SmallVector<Value *, 16> ExtendedDefs;
   SmallVector<Instruction *, 16> PromotedInsts;
   SmallVector<WeakTrackingVH, 32> DeadInsts;
@@ -50,10 +51,23 @@ private:
     return BitWidth > 1 && BitWidth < 64;
   }
 
+  static bool isPromotableZExtSource(Type *Ty) {
+    auto *IntTy = dyn_cast_or_null<IntegerType>(Ty);
+    if (!IntTy)
+      return false;
+
+    return IntTy->getBitWidth() < 64;
+  }
+
   static bool isPromotableOpcode(unsigned Opcode) {
     switch (Opcode) {
     case Instruction::Add:
+    case Instruction::Mul:
     case Instruction::Sub:
+    case Instruction::SDiv:
+    case Instruction::SRem:
+    case Instruction::Shl:
+    case Instruction::AShr:
     case Instruction::And:
     case Instruction::Or:
     case Instruction::Xor:
@@ -63,10 +77,23 @@ private:
     }
   }
 
+  static bool hasDisallowedNoWrapFlags(const BinaryOperator *BO) {
+    switch (BO->getOpcode()) {
+    case Instruction::Add:
+    case Instruction::Sub:
+    case Instruction::Mul:
+    case Instruction::Shl:
+      return BO->hasNoSignedWrap() || BO->hasNoUnsignedWrap();
+    default:
+      return false;
+    }
+  }
+
   static bool isPromotableBinaryInstruction(Instruction *I) {
     auto *BO = dyn_cast_or_null<BinaryOperator>(I);
     return BO && isPromotableNarrowInteger(BO->getType()) &&
-           isPromotableOpcode(BO->getOpcode());
+           isPromotableOpcode(BO->getOpcode()) &&
+           !hasDisallowedNoWrapFlags(BO);
   }
 
   static bool isPromotablePhiInstruction(Instruction *I) {
@@ -74,8 +101,40 @@ private:
     return PN && isPromotableNarrowInteger(PN->getType());
   }
 
+  static bool isPromotableZExtInstruction(Instruction *I) {
+    auto *ZExt = dyn_cast_or_null<ZExtInst>(I);
+    return ZExt && isPromotableZExtSource(ZExt->getOperand(0)->getType()) &&
+           isPromotableNarrowInteger(ZExt->getType());
+  }
+
   static bool isPromotableInstruction(Instruction *I) {
-    return isPromotableBinaryInstruction(I) || isPromotablePhiInstruction(I);
+    return isPromotableBinaryInstruction(I) || isPromotablePhiInstruction(I) ||
+           isPromotableZExtInstruction(I);
+  }
+
+  static bool isPromotableICmpPredicate(CmpInst::Predicate Pred) {
+    switch (Pred) {
+    case CmpInst::ICMP_EQ:
+    case CmpInst::ICMP_NE:
+    case CmpInst::ICMP_UGT:
+    case CmpInst::ICMP_UGE:
+    case CmpInst::ICMP_ULT:
+    case CmpInst::ICMP_ULE:
+    case CmpInst::ICMP_SGT:
+    case CmpInst::ICMP_SGE:
+    case CmpInst::ICMP_SLT:
+    case CmpInst::ICMP_SLE:
+      return true;
+    default:
+      return false;
+    }
+  }
+
+  static bool isPromotableICmpInstruction(Instruction *I) {
+    auto *Cmp = dyn_cast_or_null<ICmpInst>(I);
+    return Cmp && isPromotableICmpPredicate(Cmp->getPredicate()) &&
+           isPromotableNarrowInteger(Cmp->getOperand(0)->getType()) &&
+           isPromotableNarrowInteger(Cmp->getOperand(1)->getType());
   }
 
   static bool isMatchingI64SExt(Instruction *I, Value *Original) {
@@ -84,10 +143,9 @@ private:
            SExt->getType()->isIntegerTy(64);
   }
 
-  static bool isMatchingI64ZExt(Instruction *I, Value *Original) {
+  static bool isMatchingZExt(Instruction *I, Value *Original) {
     auto *ZExt = dyn_cast<ZExtInst>(I);
-    return ZExt && ZExt->getOperand(0) == Original &&
-           ZExt->getType()->isIntegerTy(64);
+    return ZExt && ZExt->getOperand(0) == Original;
   }
 
   void rememberDead(Value *V) {
@@ -222,6 +280,55 @@ private:
     return Wide;
   }
 
+  Value *getZExtInputValue(Value *Original) {
+    if (!isPromotableZExtSource(Original->getType()))
+      return nullptr;
+
+    if (auto *Existing = ZExtTruncMap.lookup(Original))
+      return Existing;
+
+    Value *Wide = WideMap.lookup(Original);
+    if (!Wide)
+      return Original;
+
+    Instruction *InsertBefore = getInsertPoint(Wide);
+    if (!InsertBefore)
+      return nullptr;
+
+    StringRef BaseName = Original->hasName() ? Original->getName() : "tp";
+    IRBuilder<> Builder(InsertBefore);
+    Value *ZExtTrunc = Builder.CreateTrunc(Wide, Original->getType(),
+                                           BaseName + ".zext.trunc");
+
+    ZExtTruncMap[Original] = ZExtTrunc;
+    rememberDead(ZExtTrunc);
+    return ZExtTrunc;
+  }
+
+  Value *promoteZExt(ZExtInst *ZI) {
+    if (Value *Wide = WideMap.lookup(ZI))
+      return Wide;
+
+    Value *Input = getZExtInputValue(ZI->getOperand(0));
+    if (!Input)
+      return nullptr;
+
+    StringRef BaseName = ZI->hasName() ? ZI->getName() : "zext";
+    IRBuilder<> Builder(ZI);
+    Value *Wide = Builder.CreateZExt(Input, getI64Type(), BaseName + ".wide");
+    Value *Trunc =
+        Builder.CreateTrunc(Wide, ZI->getType(), BaseName + ".trunc");
+
+    WideMap[ZI] = Wide;
+    TruncMap[ZI] = Trunc;
+    PromotedInsts.push_back(ZI);
+
+    rememberDead(Wide);
+    rememberDead(Trunc);
+    rememberDead(ZI);
+    return Wide;
+  }
+
   Value *getWideValue(Value *V) {
     if (Value *Wide = WideMap.lookup(V))
       return Wide;
@@ -237,6 +344,8 @@ private:
         return promoteBinary(cast<BinaryOperator>(I));
       if (isPromotablePhiInstruction(I))
         return promotePhi(cast<PHINode>(I));
+      if (isPromotableZExtInstruction(I))
+        return promoteZExt(cast<ZExtInst>(I));
 
       return createExtend(I, getInsertPoint(I), true);
     }
@@ -246,6 +355,23 @@ private:
           V, &*F.getEntryBlock().getFirstNonPHIOrDbgOrAlloca(), true);
 
     return nullptr;
+  }
+
+  bool promoteICmp(ICmpInst *Cmp) {
+    Value *LHS = getWideValue(Cmp->getOperand(0));
+    Value *RHS = getWideValue(Cmp->getOperand(1));
+    if (!LHS || !RHS)
+      return false;
+
+    StringRef BaseName = Cmp->hasName() ? Cmp->getName() : "icmp";
+    auto *WideCmp = new ICmpInst(Cmp, Cmp->getPredicate(), LHS, RHS,
+                                 BaseName + ".wide");
+    WideCmp->setSameSign(Cmp->hasSameSign());
+
+    Cmp->replaceAllUsesWith(WideCmp);
+    rememberDead(WideCmp);
+    rememberDead(Cmp);
+    return true;
   }
 
   bool promoteTypes() {
@@ -262,6 +388,11 @@ private:
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
           if (isPromotableNarrowInteger(LI->getType()))
             Changed |= getWideValue(LI) != nullptr;
+          continue;
+        }
+
+        if (isPromotableICmpInstruction(&I)) {
+          Changed |= promoteICmp(cast<ICmpInst>(&I));
           continue;
         }
 
@@ -287,6 +418,15 @@ private:
       auto *UserI = dyn_cast<Instruction>(U);
       if (!UserI || UserI == Wide)
         continue;
+
+      if (isMatchingZExt(UserI, Original)) {
+        Value *ZExtInput = getZExtInputValue(Original);
+        if (!ZExtInput)
+          continue;
+        UserI->replaceUsesOfWith(Original, ZExtInput);
+        Changed = true;
+        continue;
+      }
 
       if (!isMatchingI64SExt(UserI, Original))
         continue;
@@ -315,8 +455,11 @@ private:
       if (!UserI || UserI == Wide || UserI == Trunc)
         continue;
 
-      if (isMatchingI64ZExt(UserI, Original)) {
-        UserI->replaceUsesOfWith(Original, Trunc);
+      if (isMatchingZExt(UserI, Original)) {
+        Value *ZExtInput = getZExtInputValue(Original);
+        if (!ZExtInput)
+          continue;
+        UserI->replaceUsesOfWith(Original, ZExtInput);
         Changed = true;
         continue;
       }

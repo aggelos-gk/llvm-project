@@ -281,6 +281,32 @@ private:
     return false;
   }
 
+  static bool isCase2InstructionNNeg(Instruction *I) {
+    if (isCase2Instruction(I))
+      return true;
+
+    if (isa<ICmpInst>(I))
+      return true;
+
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      switch (BO->getOpcode()) {
+
+      case Instruction::Mul:
+      case Instruction::LShr:
+      case Instruction::AShr:
+      case Instruction::UDiv:
+      case Instruction::SDiv:
+      case Instruction::URem:
+      case Instruction::SRem:
+        return true;
+      default:
+        return false;
+      }
+    }
+
+    return false;
+  }
+
   bool AnalyzeUSE(ZExtInst *ZExt, Value *Current, Instruction *I,
                   AnalyzeState &State) {
     // USE flag: already visited for this current path value.
@@ -295,7 +321,9 @@ private:
 
     // Case 2:
     // recurse on all users of I
-    if (isCase2Instruction(I)) {
+    bool RelaxedNNeg = ZExt->hasNonNeg();
+    if ((RelaxedNNeg && isCase2InstructionNNeg(I)) ||
+        (!RelaxedNNeg && isCase2Instruction(I))) {
       for (User *U : I->users()) {
         auto *UserI = dyn_cast<Instruction>(U);
         if (!UserI)

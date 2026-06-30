@@ -10,6 +10,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/Transforms/Scalar/KawahitoZextAlgorithm.h"
 #include "llvm/Transforms/Utils/Local.h"
 
@@ -148,6 +149,43 @@ private:
     Ext->replaceAllUsesWith(Wide);
     RecursivelyDeleteTriviallyDeadInstructions(Ext);
     return true;
+  }
+
+  bool FoldRoundTripTruncUsers(CastInst *Ext) {
+    auto *SrcTy = dyn_cast<IntegerType>(Ext->getSrcTy());
+    auto *DstTy = dyn_cast<IntegerType>(Ext->getDestTy());
+    if (!SrcTy || !DstTy)
+      return false;
+
+    SmallVector<TruncInst *, 8> CandidateTruncs;
+    for (User *U : Ext->users()) {
+      auto *Trunc = dyn_cast<TruncInst>(U);
+      if (!Trunc)
+        continue;
+
+      auto *TruncSrcTy = dyn_cast<IntegerType>(Trunc->getSrcTy());
+      auto *TruncDstTy = dyn_cast<IntegerType>(Trunc->getDestTy());
+      if (!TruncSrcTy || !TruncDstTy)
+        continue;
+
+      if (TruncSrcTy == DstTy && TruncDstTy == SrcTy)
+        CandidateTruncs.push_back(Trunc);
+    }
+
+    bool Changed = false;
+    for (TruncInst *Trunc : CandidateTruncs) {
+      if (!Trunc->getParent())
+        continue;
+
+      Value *Src = Ext->getOperand(0);
+      Trunc->replaceAllUsesWith(Src);
+      Changed = true;
+      RecursivelyDeleteTriviallyDeadInstructions(Trunc);
+    }
+
+    if (Changed && Ext->getParent())
+      RecursivelyDeleteTriviallyDeadInstructions(Ext);
+    return Changed;
   }
 
 
@@ -373,9 +411,15 @@ private:
     return true;
   }
 
-	  bool EliminateOneExtend(CastInst *Ext) {
-	    AnalyzeState State;
-	    bool Required = false;
+		  bool EliminateOneExtend(CastInst *Ext) {
+        WeakTrackingVH ExtHandle(Ext);
+        bool Changed = FoldRoundTripTruncUsers(Ext);
+        if (!ExtHandle)
+          return true;
+        Ext = cast<CastInst>(ExtHandle.operator Value *());
+
+		    AnalyzeState State;
+		    bool Required = false;
 
     for (User *U : Ext->users()) {
       auto *UI = dyn_cast<Instruction>(U);
@@ -389,18 +433,18 @@ private:
         break;
     }
 
-    if (!Required) {
-      errs() << "extend can be eliminated by USE: " << *Ext << "\n";
-      if (RemoveCanonicalExtend(Ext))
-        return true;
-      if (auto *ZExt = dyn_cast<ZExtInst>(Ext))
-        return ConvertZExtToSExt(ZExt);
-      return false;
-    }
+	    if (!Required) {
+	      errs() << "extend can be eliminated by USE: " << *Ext << "\n";
+	      if (RemoveCanonicalExtend(Ext))
+	        return true;
+	      if (auto *ZExt = dyn_cast<ZExtInst>(Ext))
+	        return ConvertZExtToSExt(ZExt) || Changed;
+	      return Changed;
+	    }
 
-	    errs() << "extend is still required: " << *Ext << "\n";
-	    return false;
-	  }
+		    errs() << "extend is still required: " << *Ext << "\n";
+		    return Changed;
+		  }
 
 
 

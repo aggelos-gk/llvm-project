@@ -6,6 +6,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -13,6 +14,7 @@
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Transforms/Scalar/AddZextAfterAlloca.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include <algorithm>
 
 using namespace llvm;
 
@@ -30,6 +32,7 @@ public:
     bool Changed = promoteTypes();
     Changed |= prepareSafeExts();
     Changed |= rewriteRejectedExtUsers();
+    Changed |= rewriteCrossBlockOriginalExtUsers();
     Changed |= rewriteUsers();
     Changed |= cleanupDeadInstructions();
     return Changed;
@@ -761,7 +764,7 @@ private:
     StringRef BaseName = Original->hasName() ? Original->getName() : "tp";
     IRBuilder<> Builder(InsertBefore);
     Value *LocalWide = isa<ZExtInst>(Ext)
-                           ? Builder.CreateZExt(SourceInput, getI64Type(),
+                           ? Builder.CreateSExt(SourceInput, getI64Type(),
                                                 BaseName + ".zext.local")
                            : Builder.CreateSExt(SourceInput, getI64Type(),
                                                 BaseName + ".sext.local");
@@ -918,7 +921,7 @@ private:
     StringRef BaseName = Original->hasName() ? Original->getName() : "tp";
     IRBuilder<> Builder(InsertBefore);
     Value *LocalWide = isa<ZExtInst>(Ext)
-                           ? Builder.CreateZExt(SourceInput, Ext->getType(),
+                           ? Builder.CreateSExt(SourceInput, Ext->getType(),
                                                 BaseName + ".zext.local")
                            : Builder.CreateSExt(SourceInput, Ext->getType(),
                                                 BaseName + ".sext.local");
@@ -946,6 +949,113 @@ private:
         continue;
 
       Ext->setOperand(0, NewInput);
+      Changed = true;
+    }
+
+    return Changed;
+  }
+
+  bool rewriteCrossBlockOriginalExtUsers() {
+    SmallVector<Instruction *, 16> OriginalExts;
+    for (Instruction *Ext : SafeExts)
+      OriginalExts.push_back(Ext);
+    for (Instruction *Ext : RejectedExts)
+      OriginalExts.push_back(Ext);
+
+    if (OriginalExts.empty())
+      return false;
+
+    DominatorTree DT(F);
+    DenseMap<const Instruction *, unsigned> InstOrder;
+    unsigned Order = 0;
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB)
+        InstOrder[&I] = Order++;
+
+    bool Changed = false;
+    for (Instruction *ExtI : OriginalExts) {
+      auto *Ext = dyn_cast_or_null<CastInst>(ExtI);
+      if (!Ext || !Ext->getParent())
+        continue;
+
+      SmallVector<Instruction *, 8> ExternalUsers;
+      for (User *U : Ext->users()) {
+        auto *UserI = dyn_cast<Instruction>(U);
+        if (!UserI || InternalInsts.contains(UserI))
+          continue;
+        ExternalUsers.push_back(UserI);
+      }
+
+      if (ExternalUsers.empty())
+        continue;
+
+      // If the original ext still feeds a direct PHI, skip the downstream
+      // dummy-move entirely. Otherwise we keep both original and helper alive.
+      if (llvm::any_of(ExternalUsers,
+                       [](Instruction *UserI) { return isa<PHINode>(UserI); }))
+        continue;
+
+      SmallVector<Instruction *, 8> NonPhiExternalUsers(ExternalUsers.begin(),
+                                                        ExternalUsers.end());
+
+      if (NonPhiExternalUsers.empty())
+        continue;
+
+      auto *FirstUser = *std::min_element(
+          NonPhiExternalUsers.begin(), NonPhiExternalUsers.end(),
+          [&InstOrder](Instruction *LHS, Instruction *RHS) {
+            return InstOrder.lookup(LHS) < InstOrder.lookup(RHS);
+          });
+      if (!FirstUser || FirstUser->getParent() == Ext->getParent())
+        continue;
+
+      StringRef ExtName = Ext->hasName() ? Ext->getName() : "ext";
+      auto CreateLateHelper = [&](Instruction *InsertBefore) -> Value * {
+        IRBuilder<> Builder(InsertBefore);
+        Value *LateTrunc = Builder.CreateTrunc(
+            Ext, Ext->getSrcTy(), ExtName + ".bb.trunc");
+        Value *LateHelper = isa<ZExtInst>(Ext)
+                                ? Builder.CreateZExt(LateTrunc, Ext->getType(),
+                                                     ExtName + ".bb.zext")
+                                : Builder.CreateSExt(LateTrunc, Ext->getType(),
+                                                     ExtName + ".bb.sext");
+        trackCreated(LateTrunc);
+        trackCreated(LateHelper);
+        return LateHelper;
+      };
+
+      Instruction *InsertBefore = FirstUser;
+      if (!InsertBefore)
+        continue;
+
+      Value *BlockHelper = nullptr;
+      auto *BlockHelperI = static_cast<Instruction *>(nullptr);
+      auto IsDominatedByHelper = [&](Instruction *UserI) {
+        if (UserI->getParent() == InsertBefore->getParent())
+          return UserI == InsertBefore || InsertBefore->comesBefore(UserI);
+        return DT.dominates(InsertBefore->getParent(), UserI->getParent());
+      };
+
+      if (!llvm::all_of(NonPhiExternalUsers, IsDominatedByHelper))
+        continue;
+
+      bool ReplacedAny = false;
+      for (Instruction *UserI : NonPhiExternalUsers) {
+        if (!BlockHelper) {
+          BlockHelper = CreateLateHelper(InsertBefore);
+          BlockHelperI = cast<Instruction>(BlockHelper);
+        }
+
+        UserI->replaceUsesOfWith(Ext, BlockHelper);
+        ReplacedAny = true;
+      }
+
+      if (!ReplacedAny && BlockHelperI)
+        RecursivelyDeleteTriviallyDeadInstructions(BlockHelperI);
+
+      if (!ReplacedAny)
+        continue;
+
       Changed = true;
     }
 

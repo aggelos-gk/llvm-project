@@ -54,19 +54,6 @@ private:
 
   Type *getI64Type() const { return Type::getInt64Ty(F.getContext()); }
 
-  template <typename T>
-  static auto copySameSignIfSupportedImpl(T *Dst, const T *Src, int)
-      -> decltype(Dst->setSameSign(Src->hasSameSign()), void()) {
-    Dst->setSameSign(Src->hasSameSign());
-  }
-
-  template <typename T>
-  static void copySameSignIfSupportedImpl(T *, const T *, long) {}
-
-  static void copySameSignIfSupported(ICmpInst *Dst, const ICmpInst *Src) {
-    copySameSignIfSupportedImpl(Dst, Src, 0);
-  }
-
   static bool isAnalysisInteger(Type *Ty) {
     auto *IntTy = dyn_cast_or_null<IntegerType>(Ty);
     return IntTy && IntTy->getBitWidth() < 64;
@@ -114,12 +101,8 @@ private:
   static bool isPromotableOpcode(unsigned Opcode) {
     switch (Opcode) {
     case Instruction::Add:
-    case Instruction::Mul:
     case Instruction::Sub:
-    case Instruction::SDiv:
-    case Instruction::SRem:
     case Instruction::Shl:
-    case Instruction::AShr:
     case Instruction::And:
     case Instruction::Or:
     case Instruction::Xor:
@@ -133,7 +116,6 @@ private:
     switch (BO->getOpcode()) {
     case Instruction::Add:
     case Instruction::Sub:
-    case Instruction::Mul:
     case Instruction::Shl:
       return BO->hasNoSignedWrap() || BO->hasNoUnsignedWrap();
     default:
@@ -165,41 +147,8 @@ private:
     return PN && isPromotableNarrowInteger(PN->getType());
   }
 
-  static bool isPromotableICmpPredicate(CmpInst::Predicate Pred) {
-    switch (Pred) {
-    case CmpInst::ICMP_EQ:
-    case CmpInst::ICMP_NE:
-    case CmpInst::ICMP_UGT:
-    case CmpInst::ICMP_UGE:
-    case CmpInst::ICMP_ULT:
-    case CmpInst::ICMP_ULE:
-    case CmpInst::ICMP_SGT:
-    case CmpInst::ICMP_SGE:
-    case CmpInst::ICMP_SLT:
-    case CmpInst::ICMP_SLE:
-      return true;
-    default:
-      return false;
-    }
-  }
-
-  static bool isSafePathICmpInstruction(Instruction *I) {
-    auto *Cmp = dyn_cast_or_null<ICmpInst>(I);
-    return Cmp && isPromotableICmpPredicate(Cmp->getPredicate()) &&
-           isSafePathInteger(Cmp->getOperand(0)->getType()) &&
-           isSafePathInteger(Cmp->getOperand(1)->getType());
-  }
-
-  static bool isPromotableICmpInstruction(Instruction *I) {
-    auto *Cmp = dyn_cast_or_null<ICmpInst>(I);
-    return Cmp && isPromotableICmpPredicate(Cmp->getPredicate()) &&
-           isPromotableNarrowInteger(Cmp->getOperand(0)->getType()) &&
-           isPromotableNarrowInteger(Cmp->getOperand(1)->getType());
-  }
-
   static bool isSafePathInstruction(Instruction *I) {
-    return isSafePathBinaryInstruction(I) || isSafePathPhiInstruction(I) ||
-           isSafePathICmpInstruction(I);
+    return isSafePathBinaryInstruction(I) || isSafePathPhiInstruction(I);
   }
 
   static bool isSinkInstruction(const Instruction *I) {
@@ -290,10 +239,6 @@ private:
       return Finish(true);
     }
 
-    if (isPromotableICmpInstruction(I))
-      return Finish(isUpstreamPromotableImpl(I->getOperand(0), Memo, Visiting) &&
-                    isUpstreamPromotableImpl(I->getOperand(1), Memo, Visiting));
-
     if (isRelevantExtendInstruction(I))
       return Finish(isUpstreamPromotableImpl(I->getOperand(0), Memo, Visiting));
 
@@ -379,8 +324,8 @@ private:
       if (!isSafePathInstruction(UserI))
         continue;
 
-      if (isPromotableBinaryInstruction(UserI) || isPromotablePhiInstruction(UserI) ||
-          isPromotableICmpInstruction(UserI)) {
+      if (isPromotableBinaryInstruction(UserI) ||
+          isPromotablePhiInstruction(UserI)) {
         if (isUpstreamPromotable(UserI, UpstreamMemo))
           return Finish(true);
         continue;
@@ -538,11 +483,6 @@ private:
       return;
     }
 
-    if (isPromotableICmpInstruction(I)) {
-      AllowedPromotionValues.insert(I);
-      markSafeBackward(I->getOperand(0), Seen);
-      markSafeBackward(I->getOperand(1), Seen);
-    }
   }
 
   void markSafeForward(Value *V, SmallPtrSetImpl<Value *> &Seen) {
@@ -564,8 +504,8 @@ private:
       if (!isSafePathInstruction(UserI))
         continue;
 
-      if (isPromotableBinaryInstruction(UserI) || isPromotablePhiInstruction(UserI) ||
-          isPromotableICmpInstruction(UserI))
+      if (isPromotableBinaryInstruction(UserI) ||
+          isPromotablePhiInstruction(UserI))
         AllowedPromotionValues.insert(UserI);
 
       markSafeForward(UserI, Seen);
@@ -839,23 +779,6 @@ private:
     return nullptr;
   }
 
-  bool promoteICmp(ICmpInst *Cmp) {
-    Value *LHS = getWideValue(Cmp->getOperand(0));
-    Value *RHS = getWideValue(Cmp->getOperand(1));
-    if (!LHS || !RHS)
-      return false;
-
-    StringRef BaseName = Cmp->hasName() ? Cmp->getName() : "icmp";
-    auto *WideCmp = new ICmpInst(Cmp, Cmp->getPredicate(), LHS, RHS,
-                                 BaseName + ".wide");
-    copySameSignIfSupported(WideCmp, Cmp);
-
-    Cmp->replaceAllUsesWith(WideCmp);
-    trackCreated(WideCmp);
-    rememberDead(Cmp);
-    return true;
-  }
-
   bool promoteTypes() {
     bool Changed = false;
 
@@ -870,12 +793,6 @@ private:
         if (isSourceRootValue(&I) && AllowedPromotionValues.contains(&I) &&
             isPromotableNarrowInteger(I.getType())) {
           Changed |= getWideValue(&I) != nullptr;
-          continue;
-        }
-
-        if (isPromotableICmpInstruction(&I) &&
-            AllowedPromotionValues.contains(&I)) {
-          Changed |= promoteICmp(cast<ICmpInst>(&I));
           continue;
         }
 
@@ -921,9 +838,9 @@ private:
     StringRef BaseName = Original->hasName() ? Original->getName() : "tp";
     IRBuilder<> Builder(InsertBefore);
     Value *LocalWide = isa<ZExtInst>(Ext)
-                           ? Builder.CreateSExt(SourceInput, Ext->getType(),
+                           ? Builder.CreateSExt(SourceInput, getI64Type(),
                                                 BaseName + ".zext.local")
-                           : Builder.CreateSExt(SourceInput, Ext->getType(),
+                           : Builder.CreateSExt(SourceInput, getI64Type(),
                                                 BaseName + ".sext.local");
     Value *LocalTrunc = Builder.CreateTrunc(
         LocalWide, Original->getType(),
@@ -978,31 +895,31 @@ private:
       if (!Ext || !Ext->getParent())
         continue;
 
-      SmallVector<Instruction *, 8> ExternalUsers;
+      SmallVector<Instruction *, 8> DirectUsers;
       for (User *U : Ext->users()) {
         auto *UserI = dyn_cast<Instruction>(U);
-        if (!UserI || InternalInsts.contains(UserI))
+        if (!UserI)
           continue;
-        ExternalUsers.push_back(UserI);
+        DirectUsers.push_back(UserI);
       }
 
-      if (ExternalUsers.empty())
+      if (DirectUsers.empty())
         continue;
 
-      // If the original ext still feeds a direct PHI, skip the downstream
-      // dummy-move entirely. Otherwise we keep both original and helper alive.
-      if (llvm::any_of(ExternalUsers,
+      // Downstream move is only valid if every direct instruction user can be
+      // rewritten to the late helper. Otherwise the original would stay alive
+      // for non-trunc users and we would keep both original and dummy.
+      if (llvm::any_of(DirectUsers,
                        [](Instruction *UserI) { return isa<PHINode>(UserI); }))
         continue;
 
-      SmallVector<Instruction *, 8> NonPhiExternalUsers(ExternalUsers.begin(),
-                                                        ExternalUsers.end());
-
-      if (NonPhiExternalUsers.empty())
+      if (llvm::any_of(DirectUsers, [&](Instruction *UserI) {
+            return UserI->getParent() == Ext->getParent();
+          }))
         continue;
 
       auto *FirstUser = *std::min_element(
-          NonPhiExternalUsers.begin(), NonPhiExternalUsers.end(),
+          DirectUsers.begin(), DirectUsers.end(),
           [&InstOrder](Instruction *LHS, Instruction *RHS) {
             return InstOrder.lookup(LHS) < InstOrder.lookup(RHS);
           });
@@ -1036,11 +953,11 @@ private:
         return DT.dominates(InsertBefore->getParent(), UserI->getParent());
       };
 
-      if (!llvm::all_of(NonPhiExternalUsers, IsDominatedByHelper))
+      if (!llvm::all_of(DirectUsers, IsDominatedByHelper))
         continue;
 
       bool ReplacedAny = false;
-      for (Instruction *UserI : NonPhiExternalUsers) {
+      for (Instruction *UserI : DirectUsers) {
         if (!BlockHelper) {
           BlockHelper = CreateLateHelper(InsertBefore);
           BlockHelperI = cast<Instruction>(BlockHelper);

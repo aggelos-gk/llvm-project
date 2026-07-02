@@ -1,4 +1,3 @@
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/IR/Function.h"
@@ -28,8 +27,6 @@ public:
     std::vector<CastInst *> Exts = getExtendInstructions(blocks);
     bool Changed = false;
 
-    print_logs(blocks, Exts);
-
     for (CastInst *Ext : Exts) {
       if (!Ext->getParent())
         continue;
@@ -48,25 +45,7 @@ private:
 
   struct AnalyzeState {
     DenseMap<const Value *, DenseSet<const Instruction *>> USE;
-    DenseSet<const Instruction*> DEF;
   };
-
-  struct BuildState {
-    DenseMap<Value *, Value *> Cache;
-  };
-
-  static bool isDEFChainOpcode(unsigned Opcode) {
-    switch (Opcode) {
-    case Instruction::Add:
-    case Instruction::Sub:
-    case Instruction::And:
-    case Instruction::Or:
-    case Instruction::Xor:
-      return true;
-    default:
-      return false;
-    }
-  }
 
 
   std::vector<std::pair<BasicBlock*, uint64_t>> getBasicBlocksHotness() {
@@ -147,6 +126,39 @@ private:
 
     Value *Wide = Trunc->getOperand(0);
     Ext->replaceAllUsesWith(Wide);
+    RecursivelyDeleteTriviallyDeadInstructions(Ext);
+    return true;
+  }
+
+  bool FoldPreviousSameOpcodeExtend(CastInst *Ext) {
+    auto *Trunc = dyn_cast<TruncInst>(Ext->getOperand(0));
+    if (!Trunc)
+      return false;
+
+    auto *PrevExt = dyn_cast<CastInst>(Trunc->getOperand(0));
+    if (!PrevExt)
+      return false;
+
+    if (Ext->getOpcode() != PrevExt->getOpcode())
+      return false;
+
+    auto *ExtSrcTy = dyn_cast<IntegerType>(Ext->getSrcTy());
+    auto *ExtDstTy = dyn_cast<IntegerType>(Ext->getDestTy());
+    auto *PrevSrcTy = dyn_cast<IntegerType>(PrevExt->getSrcTy());
+    auto *PrevDstTy = dyn_cast<IntegerType>(PrevExt->getDestTy());
+    auto *TruncSrcTy = dyn_cast<IntegerType>(Trunc->getSrcTy());
+    auto *TruncDstTy = dyn_cast<IntegerType>(Trunc->getDestTy());
+    if (!ExtSrcTy || !ExtDstTy || !PrevSrcTy || !PrevDstTy || !TruncSrcTy ||
+        !TruncDstTy)
+      return false;
+
+    if (PrevSrcTy != ExtSrcTy || PrevDstTy != ExtDstTy)
+      return false;
+
+    if (TruncSrcTy != PrevDstTy || TruncDstTy != PrevSrcTy)
+      return false;
+
+    Ext->replaceAllUsesWith(PrevExt);
     RecursivelyDeleteTriviallyDeadInstructions(Ext);
     return true;
   }
@@ -411,9 +423,14 @@ private:
     return true;
   }
 
-		  bool EliminateOneExtend(CastInst *Ext) {
+			  bool EliminateOneExtend(CastInst *Ext) {
         WeakTrackingVH ExtHandle(Ext);
-        bool Changed = FoldRoundTripTruncUsers(Ext);
+        bool Changed = FoldPreviousSameOpcodeExtend(Ext);
+        if (!ExtHandle)
+          return true;
+        Ext = cast<CastInst>(ExtHandle.operator Value *());
+
+        Changed |= FoldRoundTripTruncUsers(Ext);
         if (!ExtHandle)
           return true;
         Ext = cast<CastInst>(ExtHandle.operator Value *());
@@ -434,7 +451,6 @@ private:
     }
 
 	    if (!Required) {
-	      errs() << "extend can be eliminated by USE: " << *Ext << "\n";
 	      if (RemoveCanonicalExtend(Ext))
 	        return true;
 	      if (auto *ZExt = dyn_cast<ZExtInst>(Ext))
@@ -442,28 +458,8 @@ private:
 	      return Changed;
 	    }
 
-		    errs() << "extend is still required: " << *Ext << "\n";
-		    return Changed;
-		  }
-
-
-
-  void print_logs(
-      const std::vector<std::pair<BasicBlock*, uint64_t>> &hotness,
-      std::vector<CastInst *> Exts) {
-
-      errs() << "\n=== Function: " << F.getName() << " ===\n";
-
-      for (auto &[BB, freq] : hotness) {
-        errs() << "BasicBlock: ";
-        BB->printAsOperand(errs(), false);
-        errs() << " hotness=" << freq << "\n";
-      }
-
-      for (CastInst *I : Exts) {
-          errs() << *I << "\n";
-      }
-  }
+	    return Changed;
+	  }
 };
 
 } // namespace
